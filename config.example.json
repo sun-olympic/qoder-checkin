@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "name": "global",
+      "region": "global",
+      "base_url": "https://openapi.qoder.sh",
+      "token_env": "QODER_GLOBAL_TOKEN",
+      "token_file": "credentials-global.json",
+      "api_mode": "campaigns",
+      "auth_source": "file"
+    },
+    {
+      "name": "cn",
+      "region": "cn",
+      "base_url": "https://gateway.qoder.com.cn",
+      "token_env": "QODER_CN_TOKEN",
+      "token_file": "credentials-cn.json",
+      "api_mode": "campaigns",
+      "auth_source": "file"
+    }
+  ],
+  "schedule": {
+    "at": "10:05"
+  },
+  "notify_channel": "none",
+  "wx_test_appid": "",
+  "wx_test_secret": "",
+  "wx_test_touser": "",
+  "wx_test_template_id": ""
+}

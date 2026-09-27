@@ -1,0 +1,44 @@
+name: Qoder daily check-in
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 2 * * *' # UTC+8 10:05
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qoder-daily-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Two regions can take > 5 minutes with bounded HTTP retries.
+    env:
+      QODER_GLOBAL_TOKEN: ${{ secrets.QODER_GLOBAL_TOKEN }}
+      QODER_CN_TOKEN: ${{ secrets.QODER_CN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check configured accounts
+        shell: bash
+        run: |
+          rc=0
+          configured=0
+          if [[ -n "$QODER_GLOBAL_TOKEN" ]]; then
+            configured=1
+            python qoder_checkin.py claim --region global --json || rc=1
+          fi
+          if [[ -n "$QODER_CN_TOKEN" ]]; then
+            configured=1
+            python qoder_checkin.py claim --region cn --json || rc=1
+          fi
+          if [[ "$configured" == 0 ]]; then
+            echo '请在 Actions Secrets 中设置 QODER_GLOBAL_TOKEN 或 QODER_CN_TOKEN。'
+            exit 2
+          fi
+          exit "$rc"
