@@ -147,6 +147,8 @@ def login(context, timeout=300):
     print('请在浏览器扫码登录微信测试号；无需复制 AppID 或 AppSecret。', flush=True)
     deadline = time.monotonic() + timeout
     clicked = False
+    relogin_attempted = False
+    initialization_failed = False
     seen_locations = set()
     while time.monotonic() < deadline:
         for candidate in reversed(context.pages):
@@ -166,6 +168,18 @@ def login(context, timeout=300):
                 if creds.get('appid') and creds.get('appsecret'):
                     candidate.bring_to_front()
                     return candidate, creds['appid'], creds['appsecret']
+                failure = frame.get_by_text('初始化失败', exact=True).first
+                if failure.count() and failure.is_visible():
+                    initialization_failed = True
+                    retry = frame.get_by_text('重新登录', exact=True).first
+                    if not relogin_attempted and retry.count() and retry.is_visible():
+                        # 微信错误页使用“重新登录”，不是普通登录页的“登录”。
+                        # 只尝试一次，避免持续点击导致扫码页面反复重置。
+                        relogin_attempted = True
+                        print('微信页面初始化失败，正在尝试重新登录一次；请在新页面扫码。', flush=True)
+                        retry.click(timeout=5000)
+                        clicked = False
+                    continue
                 button = frame.get_by_text('登录', exact=True).first
                 if not clicked and button.count() and button.is_visible():
                     button.click(timeout=5000)
@@ -173,6 +187,10 @@ def login(context, timeout=300):
         if not context.pages:
             raise notify.NotifyError('浏览器已关闭，原配置未修改')
         context.pages[-1].wait_for_timeout(1000)
+    if initialization_failed:
+        raise notify.NotifyError(
+            '微信测试号页面曾显示“初始化失败”，重新登录后仍未完成绑定。'
+            '请在普通浏览器打开测试号页面确认能否扫码登录，并检查网络后重试 wx-bind；原配置未修改')
     raise notify.NotifyError('等待微信扫码登录超时，原配置未修改')
 
 

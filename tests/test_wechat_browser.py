@@ -79,3 +79,42 @@ class BrowserBindingTests(unittest.TestCase):
     def test_credential_extraction_requires_wechat_https_origin(self):
         self.assertTrue(wx.trusted(Mock(url=wx.URL)))
         self.assertFalse(wx.trusted(Mock(url='https://mp.weixin.qq.com.evil.example/')))
+
+
+class LoginRecoveryTests(unittest.TestCase):
+    def make_context(self):
+        context = Mock()
+        page = Mock(url=wx.URL)
+        context.new_page.return_value = page
+        context.pages = [page]
+        page.is_closed.return_value = False
+        page.frames = [page]
+        page.evaluate.return_value = {}
+        controls = {}
+        def get_text(text, exact=True):
+            if text not in controls:
+                control = Mock()
+                control.first = control
+                control.count.return_value = 1 if text in ('初始化失败', '重新登录') else 0
+                control.is_visible.return_value = True
+                controls[text] = control
+            return controls[text]
+        page.get_by_text.side_effect = get_text
+        return context, page, controls
+
+    def test_initialization_failure_retries_relogin_then_reads_credentials(self):
+        context, page, controls = self.make_context()
+        def click(**kwargs):
+            page.evaluate.return_value = {'appid': 'wx12345678', 'appsecret': 'fake-secret'}
+        page.get_by_text('重新登录', exact=True).click.side_effect = click
+        with patch.object(wx.time, 'monotonic', side_effect=[0, 1, 2, 301]):
+            result = wx.login(context)
+        self.assertEqual(result, (page, 'wx12345678', 'fake-secret'))
+        controls['重新登录'].click.assert_called_once()
+
+    def test_persistent_initialization_failure_explains_problem_without_retry_loop(self):
+        context, page, controls = self.make_context()
+        with patch.object(wx.time, 'monotonic', side_effect=[0, 1, 2, 301]):
+            with self.assertRaisesRegex(wx.notify.NotifyError, '初始化失败'):
+                wx.login(context)
+        controls['重新登录'].click.assert_called_once()
