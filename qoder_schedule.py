@@ -8,11 +8,17 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 
 class ScheduleError(Exception):
+    pass
+
+
+class BackgroundPermissionError(ScheduleError):
     pass
 
 
@@ -33,6 +39,59 @@ class Scheduler:
         self.plist = Path.home() / 'Library/LaunchAgents' / (self.label + '.plist')
         self.argv = [sys.executable, str(Path(__file__).with_name('checkin_cli.py')),
                      'run', '--config', str(self.config), '--region', region]
+
+    @property
+    def startup_log(self):
+        return Path.home() / 'Library/Logs/qoder-checkin' / (self.key + '.log')
+
+    def preflight(self, token_files):
+        """Probe launchd access without claiming rewards or sending messages."""
+        if self.platform != 'darwin':
+            return
+        self.startup_log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix='preflight-', dir=self.startup_log.parent) as tmp:
+            root = Path(tmp)
+            marker = root / 'ok'
+            label = self.label + '.probe.' + uuid.uuid4().hex
+            definition = plistlib.loads(self.definition())
+            definition.pop('StartCalendarInterval')
+            definition['Label'] = label
+            script = (
+                'import sys, pathlib, runpy\n'
+                'try:\n'
+                ' sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))\n'
+                ' runpy.run_path(sys.argv[1], run_name="qoder_permission_probe")\n'
+                ' for p in sys.argv[4:]:\n'
+                '  with open(p, "rb") as f: f.read(1)\n'
+                ' with open(sys.argv[3], "a"): pass\n'
+                ' pathlib.Path(sys.argv[2]).write_text("ok")\n'
+                'except Exception as e:\n'
+                ' print(type(e).__name__, flush=True); sys.exit(1)\n'
+            )
+            definition['ProgramArguments'] = [self.argv[0], '-c', script,
+                self.argv[1], str(marker), str(self.config.parent / 'checkin.log'),
+                str(self.config), *(str(p) for p in token_files)]
+            definition['StandardOutPath'] = definition['StandardErrorPath'] = str(root / 'probe.log')
+            plist = root / 'probe.plist'
+            plist.write_bytes(plistlib.dumps(definition))
+            target = f'gui/{os.getuid()}/{label}'
+            try:
+                result = self.command(['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(plist)])
+                if result.returncode:
+                    raise ScheduleError('后台权限检测任务无法注册，未修改定时任务')
+                for _ in range(40):
+                    if marker.exists():
+                        return
+                    result = self.command(['launchctl', 'print', target])
+                    if re.search(r'last exit code = \d+', result.stdout):
+                        break
+                    time.sleep(0.25)
+                detail = (root / 'probe.log').read_text() if (root / 'probe.log').exists() else ''
+                if 'PermissionError' in detail or '78' in result.stdout:
+                    raise BackgroundPermissionError('后台目录访问被 macOS 拒绝；需要授权后重试')
+                raise ScheduleError('后台启动预检未通过（启动失败或超时），未修改定时任务')
+            finally:
+                self.command(['launchctl', 'bootout', target])
 
     def command(self, args):
         try:
@@ -79,13 +138,13 @@ class Scheduler:
         hour, minute = map(int, self.at.split(':'))
         if self.platform == 'darwin':
             return plistlib.dumps({'Label': self.label, 'ProgramArguments': self.argv,
-                'WorkingDirectory': str(self.config.parent), 'RunAtLoad': True,
+                'WorkingDirectory': str(Path.home()), 'RunAtLoad': True,
                 'StartCalendarInterval': {'Hour': hour, 'Minute': minute},
                 'ProcessType': 'Background',
                 'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
                                          'PYTHONIOENCODING': 'utf-8'},
-                'StandardOutPath': str(self.config.parent / 'scheduler.log'),
-                'StandardErrorPath': str(self.config.parent / 'scheduler.log')})
+                'StandardOutPath': str(self.startup_log),
+                'StandardErrorPath': str(self.startup_log)})
         # One task owns both triggers, avoiding partial installation of a pair.
         ns = 'http://schemas.microsoft.com/windows/2004/02/mit/task'
         ET.register_namespace('', ns)
@@ -162,7 +221,8 @@ class Scheduler:
             if loaded and previous is None:
                 raise ScheduleError('旧任务缺少定义文件，无法保证回滚，未修改任务')
             # Finish all preparatory writes before stopping the working service.
-            log = self.config.parent / 'scheduler.log'
+            log = self.startup_log
+            log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             os.close(fd)
             log.chmod(0o600)

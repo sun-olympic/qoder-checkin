@@ -71,6 +71,7 @@ class Account:
     client_version: str | None = None
     device_source: str = "none"
     qoder_app_path: str | None = None
+    display_name: str | None = None
 
     def device_headers(self) -> dict:
         if self.device_source == "none":
@@ -213,8 +214,20 @@ def load_accounts(path: Path, region: str) -> list[Account]:
         if version is not None and (not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", version)):
             raise ConfigError("client_version 格式错误")
         if region in ("both", kind):
+            display_name = row.get('display_name', '')
+            if not isinstance(display_name, str) or len(display_name) > 64 or any(ord(c) < 32 for c in display_name):
+                raise ConfigError('显示名称必须为不超过 64 字的单行文本')
+            display_name = display_name.strip()
+            if not display_name and token_file:
+                try:
+                    metadata = json.loads(token_file.read_text(encoding='utf-8'))
+                    nickname = metadata.get('nickname') if isinstance(metadata, dict) else None
+                    if isinstance(nickname, str):
+                        display_name = ''.join(c for c in nickname if ord(c) >= 32).strip()[:64]
+                except (OSError, ValueError):
+                    pass
             accounts.append(Account(name, kind, base.rstrip("/"), env, token_file,
-                                    mode, source, expected, version, device_source, app_path))
+                                    mode, source, expected, version, device_source, app_path, display_name or name))
     if not accounts:
         raise ConfigError("配置中没有所选地区的账号")
     return accounts
@@ -501,7 +514,8 @@ def run_once(config: Path, region: str, action: str, timeout: float) -> list[dic
             item = client.status() if action == "status" else client.claim()
         except CheckinError as exc:
             item = {"result": "error", "message": str(exc), "error_type": type(exc).__name__}
-        results.append({"account": account.name, "region": account.region, **item})
+        label = {'display_name': account.display_name} if account.display_name and account.display_name != account.name else {}
+        results.append({"account": account.name, "region": account.region, **label, **item})
     return results
 
 

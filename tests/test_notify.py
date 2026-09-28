@@ -17,6 +17,7 @@ class NotificationTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'config.json'
         self.cfg = dict(zip(n.FIELDS, ['app', 'SECRET', 'user', 'tpl']))
         self.cfg['notify_channel'] = 'wx_test'
+        self.cfg['notify_dedupe'] = True
         self.rows = [{'account':'global', 'region':'global', 'result':'claimed',
                       'campaign_id':'daily', 'rewardCredits':100}]
 
@@ -25,6 +26,70 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(n.notify_results({}, self.path, self.rows), 'disabled')
             send.assert_not_called()
         self.assertFalse(list(self.path.parent.glob('*.notify-state.json')))
+
+    def test_notification_uses_display_name(self):
+        title, _ = n.result_message(dict(self.rows[0], display_name='我的主账号'))
+        self.assertTrue(title.startswith('[我的主账号]'))
+
+    def test_default_sends_on_every_run_ignoring_old_state(self):
+        cfg = {k:v for k,v in self.cfg.items() if k != 'notify_dedupe'}
+        state = self.path.with_name('config.json.notify-state.json')
+        state.write_text('old invalid state')
+        with patch.object(n, 'send') as send:
+            self.assertEqual(n.notify_results(cfg, self.path, self.rows), 'accepted')
+            self.assertEqual(n.notify_results(cfg, self.path, self.rows), 'accepted')
+            self.assertEqual(send.call_count, 2)
+        self.assertEqual(state.read_text(), 'old invalid state')
+
+    def test_default_attempts_remaining_accounts_after_push_failure(self):
+        cfg = {k:v for k,v in self.cfg.items() if k != 'notify_dedupe'}
+        rows = self.rows + [dict(self.rows[0], account='other')]
+        with patch.object(n, 'send', side_effect=[n.NotifyError('failed'), None]) as send:
+            with self.assertRaises(n.NotifyError):
+                n.notify_results(cfg, self.path, rows)
+            self.assertEqual(send.call_count, 2)
+
+    def test_multi_account_workbuddy_style_and_independent_dedupe(self):
+        rows = [dict(self.rows[0], account='personal'),
+                dict(self.rows[0], account='work', result='already_claimed'),
+                dict(self.rows[0], account='backup', result='error',
+                     error_type='AuthError', message='SECRET')]
+        with patch.object(n, 'send') as send:
+            n.notify_results(self.cfg, self.path, rows)
+            self.assertEqual(send.call_count, 3)
+            titles = [c.args[1] for c in send.call_args_list]
+            self.assertEqual(titles, ['[personal] 🎉 Qoder 自动签到成功',
+                '[work] ✅ Qoder 本轮已签到', '[backup] ❌ Qoder 签到失败'])
+            self.assertIn('本次未重复领取', send.call_args_list[1].args[2])
+            self.assertIn('重新登录', send.call_args_list[2].args[2])
+            self.assertNotIn('SECRET', str([c.args[1:] for c in send.call_args_list]))
+            self.assertNotIn('100 Credits', send.call_args_list[2].args[2])
+            send.reset_mock()
+            n.notify_results(self.cfg, self.path, rows)
+            send.assert_not_called()
+            rows[2] = dict(self.rows[0], account='backup')
+            n.notify_results(self.cfg, self.path, rows)
+            send.assert_called_once()
+            self.assertIn('[backup]', send.call_args.args[1])
+
+    def test_partial_push_failure_retries_only_unsent_accounts(self):
+        rows = self.rows + [dict(self.rows[0], account='other')]
+        with patch.object(n, 'send', side_effect=[None, n.NotifyError('failed')]):
+            with self.assertRaises(n.NotifyError):
+                n.notify_results(self.cfg, self.path, rows)
+        with patch.object(n, 'send') as send:
+            n.notify_results(self.cfg, self.path, rows)
+            send.assert_called_once()
+            self.assertIn('[other]', send.call_args.args[1])
+
+    def test_status_messages_do_not_invent_success_or_rewards(self):
+        for outcome, expected in [('unavailable', '暂不可签到'), ('claimable', '仅查询'),
+                                  ('unknown', '状态未知'), ('error', '签到失败')]:
+            title, content = n.result_message(dict(self.rows[0], result=outcome,
+                rewardCredits=float('nan'), message='SECRET'))
+            self.assertIn(expected, title + content)
+            self.assertNotIn('SECRET', title + content)
+            self.assertNotIn('Credits', content)
 
     def test_dedupe_success_already_claimed_and_new_campaign(self):
         with patch.object(n, 'send') as send:
@@ -109,9 +174,9 @@ class NotificationTests(unittest.TestCase):
 
     def test_main_wizard_notification_choices_and_cancel_are_atomic(self):
         original = {**self.cfg, 'accounts':[], 'schedule':{'at':'10:05'}}
-        for choice in ('1', '2', '3', 'invalid'):
+        for choice in ('1', '2', '3', '4', 'invalid'):
             cli.save_config(self.path, original)
-            with patch.object(cli, 'read_config', return_value=json.loads(json.dumps(original))), patch('builtins.input', side_effect=['11:00', choice, '2', 'n']), patch.object(cli, 'getpass', return_value=''), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(cli, 'read_config', return_value=json.loads(json.dumps(original))), patch('builtins.input', side_effect=['', '11:00', choice, '2', 'n']), patch.object(cli, 'getpass', return_value=''), patch.object(cli, 'configure_wechat_browser', side_effect=lambda c: dict(c)) as browser, contextlib.redirect_stdout(io.StringIO()):
                 if choice == 'invalid':
                     with self.assertRaises(cli.q.ConfigError):
                         cli.wizard(SimpleNamespace(config=self.path))
@@ -122,8 +187,9 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(saved['notify_channel'], 'none' if choice == '3' else 'wx_test')
                     self.assertEqual(saved['wx_test_secret'], 'SECRET')
                     self.assertEqual(saved['schedule']['at'], '11:00')
+                    self.assertEqual(browser.call_count, int(choice == '2'))
         cli.save_config(self.path, original)
-        with patch.object(cli, 'read_config', return_value=json.loads(json.dumps(original))), patch('builtins.input', side_effect=['11:00', '2']), patch.object(cli, 'getpass', side_effect=KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(cli, 'read_config', return_value=json.loads(json.dumps(original))), patch('builtins.input', side_effect=['', '11:00', '2']), patch.object(cli, 'configure_wechat_browser', side_effect=KeyboardInterrupt), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(KeyboardInterrupt):
                 cli.wizard(SimpleNamespace(config=self.path))
         self.assertEqual(json.loads(self.path.read_text()), original)

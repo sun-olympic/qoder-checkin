@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -102,6 +103,19 @@ def notify_results(config, config_path, results):
     """Caller holds the per-config run lock. Persist only hashes, never credentials."""
     if validate(config) == 'none':
         return 'disabled'
+    # Each execution reports its result by default, including already-claimed.
+    # Legacy cycle deduplication is available only through explicit opt-in.
+    if config.get('notify_dedupe') is not True:
+        failures = 0
+        for item in results:
+            title, content = result_message(item)
+            try:
+                send(config, title, content)
+            except NotifyError:
+                failures += 1
+        if failures:
+            raise NotifyError(f'{failures} 个账号的微信通知发送失败；其余账号已尝试推送，请检查微信配置或网络')
+        return 'accepted' if results else 'empty'
     path = config_path.with_name(config_path.name + '.notify-state.json')
     try:
         state = json.loads(path.read_text()) if path.exists() else {}
@@ -113,8 +127,6 @@ def notify_results(config, config_path, results):
     cycle = (datetime.now(BEIJING) - timedelta(hours=10)).date().isoformat()
     recipient = hashlib.sha256(json.dumps([config[k] for k in FIELDS if k != 'wx_test_secret']).encode()).hexdigest()
     pending = []
-    labels = {'claimed': '已领取', 'already_claimed': '已领取',
-              'unavailable': '暂不可领取', 'error': '签到失败，请检查本机日志', 'claimable': '可领取'}
     for item in results:
         outcome = item.get('result', 'error')
         outcome = 'claimed' if outcome == 'already_claimed' else outcome
@@ -124,23 +136,45 @@ def notify_results(config, config_path, results):
         if state.get(key) == cycle:
             continue
         # Do not forward arbitrary exception strings or API responses.
-        content = f"{item.get('account', '账号')} ({item.get('region', '')})：{labels.get(outcome, '状态未知')}"
-        credits = item.get('rewardCredits')
-        if type(credits) in (int, float):
-            content += f'，{credits} Credits'
-        pending.append((key, content))
+        title, content = result_message(item)
+        pending.append((key, title, content))
     if not pending:
         return 'duplicate'
     state = {k: v for k, v in state.items() if v == cycle}
     # One message per account avoids long template values being truncated.
-    for key, content in pending:
-        send(config, 'Qoder 签到结果', content)
+    for key, title, content in pending:
+        send(config, title, content)
         state[key] = cycle
         try:
             save_state(path, state)
         except OSError:
             raise NotifyError('微信已受理，但通知去重记录保存失败；下次运行可能重复通知') from None
     return 'accepted'
+
+
+def result_message(item):
+    """WorkBuddy-style account notices, using only safe status/error categories."""
+    outcome = item.get('result')
+    messages = {
+        'claimed': ('🎉 Qoder 自动签到成功', '本次自动签到已完成'),
+        'already_claimed': ('✅ Qoder 本轮已签到', '检测到本轮奖励此前已领取，本次未重复领取'),
+        'claimable': ('📋 Qoder 签到状态查询完成', '本轮奖励可领取；本次仅查询，未执行签到'),
+        'unavailable': ('⏳ Qoder 暂不可签到', '当前暂无可领取奖励，请以活动开放时间和资格为准'),
+    }
+    title, detail = messages.get(outcome, ('⚠️ Qoder 签到状态未知', '请检查本机日志'))
+    if outcome == 'error':
+        title = '❌ Qoder 签到失败'
+        detail = {
+            'AuthError': '登录凭证失效或账号校验未通过，请重新登录并检查账号绑定',
+            'ConfigError': '账号配置或凭证缺失，请检查本机配置',
+            'ApiError': '接口请求失败，请检查网络及本机日志',
+        }.get(item.get('error_type'), '签到未完成，请检查本机日志')
+    region = {'global': '国际站', 'cn': '中国站'}.get(item.get('region'), '未知地区')
+    content = f'{region}：{detail}'
+    credits = item.get('rewardCredits')
+    if outcome in ('claimed', 'already_claimed', 'claimable') and type(credits) in (int, float) and math.isfinite(credits) and credits >= 0:
+        content += f'；本轮奖励：{credits} Credits'
+    return f"[{item.get('display_name') or item.get('account', '账号')}] {title}", content
 
 
 def binding_options(config):

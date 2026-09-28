@@ -14,12 +14,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import uuid
 
 import qoder_checkin as q
+import qoder_auth
 import qoder_notify as notify
-from qoder_schedule import Scheduler, ScheduleError
+from qoder_schedule import Scheduler, ScheduleError, BackgroundPermissionError
 
 
 def save_config(path, data):
@@ -208,42 +211,145 @@ def doctor(args):
     return 0 if ok else 1
 
 
+def check_background_access(scheduler, token_files):
+    try:
+        scheduler.preflight(token_files)
+    except BackgroundPermissionError:
+        if scheduler.platform != 'darwin' or not sys.stdin.isatty():
+            raise
+        print('后台访问预检失败；尚未重新注册任务。若是目录权限被拒绝，请手动授权后重测。')
+        print('系统设置 → 隐私与安全 → 文件与文件夹：若有 Python 的文稿目录权限，请启用。')
+        print('若无对应选项，可在完全磁盘访问权限中添加以下 Python；这会扩大所有使用该解释器的脚本权限：')
+        print(str(Path(scheduler.argv[0]).resolve()))
+        print('无需授权 launchd/xpcproxy。若不接受此权限，可取消后将项目移到非受保护目录再安装。')
+        if input('回车打开权限设置并继续；输入 q 取消：').strip().lower() == 'q':
+            raise ScheduleError('已取消，未重新注册任务')
+        subprocess.run(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'],
+                       check=False, timeout=15)
+        if input('完成授权后回车重测；输入 q 取消：').strip().lower() == 'q':
+            raise ScheduleError('已取消，未重新注册任务')
+        scheduler.preflight(token_files)
+    if scheduler.platform == 'darwin':
+        print('后台访问预检通过（未领取、未推送）。启动日志：' + str(scheduler.startup_log))
+
+
+def wizard_accounts(config, directory):
+    rows = config.setdefault('accounts', [])
+    while True:
+        print('当前账号：' + ('、'.join(f"{r['name']} ({r['region']})" for r in rows) or '无'))
+        choice = input('账号管理：a 添加账号 / n 设置显示名称 / 回车继续设置：').strip().lower()
+        if not choice:
+            return
+        if choice == 'n':
+            target = input('请输入要设置的内部账号标识：').strip()
+            account = next((r for r in rows if r['name'] == target), None)
+            if account is None:
+                raise q.ConfigError('账号不存在')
+            label = input('自定义显示名称（留空使用登录昵称）：').strip()
+            if len(label) > 64 or any(ord(c) < 32 for c in label):
+                raise q.ConfigError('显示名称必须为不超过 64 字的单行文本')
+            account['display_name'] = label
+            continue
+        if choice != 'a':
+            raise q.ConfigError('账号管理请输入 a、n 或直接回车')
+        label = input('自定义账号名称（留空使用登录昵称，最多 64 字）：').strip()
+        if len(label) > 64 or any(ord(c) < 32 for c in label):
+            raise q.ConfigError('显示名称必须为不超过 64 字的单行文本')
+        name = label if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', label) else 'account-' + uuid.uuid4().hex[:12]
+        if any(r['name'] == name for r in rows):
+            raise q.ConfigError('账号名称无效或重复；已有账号未修改')
+        region = input('地区 global / cn [global]：').strip() or 'global'
+        if region not in q.BASES:
+            raise q.ConfigError('地区无效')
+        mode = input('凭证方式：1 浏览器登录 / 2 手动 Token [1]：').strip() or '1'
+        if mode not in ('1', '2'):
+            raise q.ConfigError('凭证方式必须为 1 或 2')
+        identity = uuid.uuid4().hex
+        credential = directory / f'credentials-{name}-{identity}.json'
+        account = {'name':name, 'region':region, 'token_file':credential.name,
+                   'display_name':label,
+                   'token_env':'QODER_ACCOUNT_' + identity.upper() + '_TOKEN',
+                   'auth_source':'file', 'api_mode':'campaigns'}
+        with tempfile.TemporaryDirectory(prefix='.qoder-add-', dir=directory) as tmp:
+            candidate = Path(tmp) / 'credential.json'
+            if mode == '1':
+                print('请在浏览器中选择新账号；若自动登录旧账号，请先退出网站登录后重试。')
+                result = qoder_auth.browser_login(region, candidate, isolated=True)
+                uid = result['account_id']
+                if any(r.get('region') == region and r.get('expected_account_id') == uid for r in rows):
+                    raise q.ConfigError('该登录账号已绑定；请切换浏览器账号后重新添加')
+                account['expected_account_id'] = uid
+            else:
+                token = getpass('Bearer Token（不回显）：').strip()
+                if not token:
+                    raise q.ConfigError('Token 不能为空')
+                q.private_json(candidate, {'token':token})
+            q.Account(name, region, q.BASES[region], '', candidate).token()
+            candidate.chmod(0o600)
+            os.link(candidate, credential)
+        rows.append(account)
+        config.setdefault('schedule', {})['region'] = 'both'
+
+
 def wizard(args):
-    print('Qoder 配置向导：API 模式无需保持客户端打开；客户端自动导入目前仅支持 macOS App。')
+    print('Qoder 配置向导：API 模式无需保持客户端打开；可通过浏览器登录获取 Bearer Token。')
     if args.config.exists():
         config = read_config(args.config)
-        print('保留现有账号和凭证配置。新增账号可编辑 accounts 数组，名称必须唯一。')
+        print('保留现有账号和凭证配置，可继续添加账号。')
     else:
         kind = input('地区 global / cn / both [global]：').strip() or 'global'
         if kind not in ('global','cn','both'): raise q.ConfigError('地区无效')
         config = {'accounts':[]}
+        auth_mode = input('凭证方式：1 浏览器登录（推荐） / 2 手动输入 Token / 3 使用环境变量 [1]：').strip() or '1'
+        if auth_mode not in ('1', '2', '3'):
+            raise q.ConfigError('凭证方式必须为 1、2 或 3')
         for region in (q.BASES if kind == 'both' else [kind]):
             credential = args.config.parent / f'credentials-{region}.json'
             if credential.exists():
                 print(f'复用已有 {credential.name}，不会覆盖。')
-            else:
+            elif auth_mode == '1':
+                try:
+                    print(f'正在打开 Qoder {region} 登录页面，请在浏览器中完成登录……')
+                    qoder_auth.browser_login(region, credential)
+                    print(f'{region} 浏览器登录完成。')
+                except (RuntimeError, OSError) as exc:
+                    raise q.ConfigError(f'{region} 浏览器登录失败：{exc}') from None
+            elif auth_mode == '2':
                 token = getpass(f'{region} Bearer Token（不回显；留空使用环境变量）：').strip()
                 if token: q.private_json(credential, {'token':token})
             config['accounts'].append({'name':region,'region':region,
                 'token_env':f'QODER_{region.upper()}_TOKEN','token_file':credential.name,
                 'api_mode':'campaigns','auth_source':'file'})
+            if credential.exists():
+                try:
+                    saved = json.loads(credential.read_text())
+                    if isinstance(saved, dict) and isinstance(saved.get('account_id'), str):
+                        config['accounts'][-1]['expected_account_id'] = saved['account_id']
+                except ValueError:
+                    pass
+    wizard_accounts(config, args.config.parent)
     at = input(f"每日时间，电脑本地时区 [{config.get('schedule',{}).get('at','10:05')}]：").strip()
     at = at or config.get('schedule',{}).get('at','10:05')
     validate_time(at)
     config.setdefault('schedule', {})['at'] = at
     current = '微信测试号' if config.get('notify_channel') == 'wx_test' else '未启用'
     print('当前通知：' + current)
-    choice = input('通知：1 保留现状 / 2 配置微信测试号 / 3 关闭通知 [1]：').strip() or '1'
+    choice = input('通知：1 保留现状 / 2 浏览器扫码绑定微信 / 3 关闭通知 / 4 手动配置 [1]：').strip() or '1'
     if choice == '2':
+        config = configure_wechat_browser(config)
+    elif choice == '4':
         config = configure_wechat(config)
     elif choice == '3':
         config['notify_channel'] = 'none'
     elif choice != '1':
-        raise q.ConfigError('通知选项必须为 1、2 或 3；配置未保存')
+        raise q.ConfigError('通知选项必须为 1、2、3 或 4；配置未保存')
     save_config(args.config, config)
+    if sys.stdin.isatty():
+        check_background_access(Scheduler(args.config),
+            [a.token_file for a in q.load_accounts(args.config, 'both') if a.token_file])
     print('配置已保存。运行 doctor 检查，再执行 install 注册定时任务。')
     if config.get('notify_channel') == 'wx_test':
-        if choice == '2':
+        if choice in ('2', '4'):
             offer_notification_test(config)
         else:
             print('运行 test-notify 验证微信推送。')
@@ -303,6 +409,38 @@ def configure_wechat(config):
     return candidate
 
 
+def configure_wechat_browser(config):
+    """Run the browser worker in its own runtime without restarting the wizard."""
+    script = q.ROOT / 'qoder_wechat.py'
+    try:
+        with tempfile.TemporaryDirectory(prefix='qoder-wx-') as directory:
+            source, output = Path(directory)/'input.json', Path(directory)/'output.json'
+            q.private_json(source, config)
+            arguments = ['--input', str(source), '--output', str(output)]
+            command = qoder_auth.bootstrap_command(script, arguments) or [sys.executable, str(script), *arguments]
+            result = subprocess.run(command, timeout=660)
+            if result.returncode == 130:
+                raise KeyboardInterrupt
+            if result.returncode != 0 or not output.exists():
+                raise q.ConfigError('微信扫码绑定未完成，原配置未修改')
+            binding = json.loads(output.read_text())
+            candidate = dict(config)
+            candidate.update({key:binding.get(key) for key in (*notify.FIELDS, 'notify_channel')})
+            if candidate.get('notify_channel') != 'wx_test':
+                raise q.ConfigError('微信绑定结果无效，原配置未修改')
+            notify.validate(candidate)
+            return candidate
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise q.ConfigError('微信浏览器组件或绑定过程失败，原配置未修改') from None
+
+
+def wx_bind(args):
+    candidate = configure_wechat_browser(read_config(args.config))
+    save_config(args.config, candidate)
+    print('微信测试号绑定成功，已自动获取关注者和模板。可运行 test-notify 验证。')
+    return 0
+
+
 def offer_notification_test(config):
     answer = input('现在发送一条微信测试通知？[y/N]：').strip().lower()
     if answer in ('y', 'yes'):
@@ -322,6 +460,32 @@ def wx_setup(args):
     return 0
 
 
+def qoder_login(args):
+    """Human-assisted browser login; does not require Qoder IDE."""
+    config = read_config(args.config) if args.config.exists() else {}
+    region = args.login_region or "global"
+    rows = config.get('accounts', [])
+    matches = [row for row in rows if row.get('region') == region]
+    if len(matches) > 1:
+        raise q.ConfigError('同地区有多个账号，请使用独立配置登录，避免覆盖其他账号')
+    account = matches[0] if matches else {'name': region, 'region': region}
+    credential = args.config.parent / account.get('token_file', f'credentials-{region}.json')
+    try:
+        result = qoder_auth.browser_login(region, credential,
+                                         expected_account_id=account.get('expected_account_id'))
+    except (RuntimeError, OSError) as exc:
+        raise q.ConfigError(str(exc)) from None
+    if not matches:
+        rows.append(account)
+    account.setdefault('token_env', f'QODER_{region.upper()}_TOKEN')
+    account.update({"token_file": str(credential.resolve()), "api_mode": "campaigns",
+                    "auth_source": "file", 'expected_account_id':result['account_id']})
+    config["accounts"] = rows
+    save_config(args.config, config)
+    print(f"{region} 登录成功，凭证已保存。可运行 doctor / install。")
+    return 0
+
+
 def test_notify(args):
     config = read_config(args.config)
     notify.send(config, 'Qoder 通知测试', '微信通知已接入；本条消息不执行签到。')
@@ -336,11 +500,12 @@ def validate_time(at):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Qoder 安装、诊断和系统定时任务')
-    parser.add_argument('command', choices=['wizard','doctor','install','uninstall','status','run','wx-setup','test-notify'])
+    parser.add_argument('command', choices=['wizard','doctor','install','uninstall','delete-config','status','run','login','wx-bind','wx-setup','test-notify'])
     parser.add_argument('--config', type=Path, default=q.ROOT/'config.json')
     parser.add_argument('--region', choices=['both','global','cn'],default=None)
     parser.add_argument('--at', help='系统定时任务时间，电脑本地时区，默认 10:05')
     parser.add_argument('--dry-run', action='store_true',help='run 只查询，不领取')
+    parser.add_argument('--login-region', choices=['global', 'cn'], default=None)
     args=parser.parse_args(argv)
     args.config=args.config.expanduser().resolve()
     # pythonw has no console; scheduled results still go to the rotating file log.
@@ -348,14 +513,27 @@ def main(argv=None):
         if getattr(sys,name) is None: setattr(sys,name,open(os.devnull,'w',encoding='utf-8'))
     try:
         with ExitStack() as management:
-            if args.command in ('wizard', 'install', 'uninstall', 'wx-setup'):
+            if args.command in ('wizard', 'install', 'uninstall', 'delete-config', 'login', 'wx-bind', 'wx-setup'):
                 args.config.parent.mkdir(parents=True, exist_ok=True)
                 lock_target = args.config.with_name(args.config.name + '.setup')
                 if not management.enter_context(run_lock(lock_target)):
                     raise q.ConfigError('已有配置或安装操作运行，请等待完成后重试')
             explicit_region = args.region
             args.region = args.region or 'both'
+            if args.command == 'delete-config':
+                if not management.enter_context(run_lock(args.config)):
+                    raise q.ConfigError('已有签到任务运行，请等待完成后再删除配置')
+                if not args.config.exists():
+                    print('配置不存在，无需删除。')
+                    return 0
+                if sys.platform in ('darwin', 'win32') and Scheduler(args.config).status():
+                    raise q.ConfigError('定时任务仍已注册，请先对同一 --config 执行 uninstall，再删除配置')
+                args.config.unlink()
+                print('配置已删除（未放入废纸篓）；保留凭证、登录缓存、任务标识和日志。可运行 wizard 重新配置。')
+                return 0
+            if args.command=='wx-bind': return wx_bind(args)
             if args.command=='wx-setup': return wx_setup(args)
+            if args.command=='login': return qoder_login(args)
             if args.command=='test-notify': return test_notify(args)
             if args.command=='wizard': return wizard(args)
             if args.command=='doctor': return doctor(args)
@@ -385,6 +563,8 @@ def main(argv=None):
                               expected_account_id=a.expected_account_id).token()
                 # Commit config before touching the OS, so a write failure cannot
                 # leave a new task running with stale metadata. Keep an atomic backup.
+                check_background_access(scheduler,
+                    [a.token_file for a in q.load_accounts(args.config, args.region)])
                 original = args.config.read_bytes()
                 backup = Scheduler.stage_file(args.config, original)
                 keep_backup = False

@@ -7,6 +7,8 @@ credentials*.json
 !.env.example
 __pycache__/
 .venv/
+.qoder-browser-venv/
+.qoder-cli-runtime/
 .DS_Store
 *.pid
 *.lock

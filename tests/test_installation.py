@@ -19,6 +19,9 @@ from qoder_schedule import Scheduler, ScheduleError
 
 class InstallationTests(unittest.TestCase):
     def setUp(self):
+        probe = patch.object(Scheduler, 'preflight')
+        probe.start()
+        self.addCleanup(probe.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name).resolve()/'folder with spaces & 中文'
@@ -102,7 +105,7 @@ class InstallationTests(unittest.TestCase):
 
     def test_wizard_keeps_existing_accounts_and_credentials(self):
         original=self.cred.read_bytes()
-        with patch('builtins.input',side_effect=['11:00', '1']):
+        with patch('builtins.input',side_effect=['', '11:00', '1']):
             self.assertEqual(cli.main(['wizard','--config',str(self.config)]),0)
         self.assertEqual(self.cred.read_bytes(),original)
         data=json.loads(self.config.read_text())
@@ -281,7 +284,7 @@ class InstallationTests(unittest.TestCase):
     def test_wizard_time_edit_preserves_schedule_region(self):
         config=json.loads(self.config.read_text());config['schedule']={'at':'10:05','region':'global'}
         cli.save_config(self.config,config)
-        with patch('builtins.input',side_effect=['11:00', '1']):
+        with patch('builtins.input',side_effect=['', '11:00', '1']):
             self.assertEqual(cli.main(['wizard','--config',str(self.config)]),0)
         self.assertEqual(json.loads(self.config.read_text())['schedule']['region'],'global')
 
