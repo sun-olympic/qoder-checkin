@@ -162,6 +162,9 @@ def result_message(item):
         'unavailable': ('⏳ Qoder 暂不可签到', '当前暂无可领取奖励，请以活动开放时间和资格为准'),
     }
     title, detail = messages.get(outcome, ('⚠️ Qoder 签到状态未知', '请检查本机日志'))
+    if outcome == 'unavailable' and item.get('server_status') == 'NO_DAILY_CAMPAIGN':
+        title = '🔎 Qoder 签到状态待确认'
+        detail = '接口未返回每日活动，不代表未签到；请稍后查询或查看客户端'
     if outcome == 'error':
         title = '❌ Qoder 签到失败'
         detail = {

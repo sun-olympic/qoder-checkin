@@ -8,6 +8,7 @@ from datetime import datetime, time as clock_time, timedelta, timezone
 from getpass import getpass
 from http.client import HTTPException
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -250,6 +251,37 @@ class Transport:
         self.client_version = client_version
         self.opener = request.build_opener(NoRedirect())
 
+    def log_response(self, method: str, path: str, attempt: int, status: int, raw: bytes):
+        """Record the server body before campaign filtering; never log request headers."""
+        def clean(value):
+            if isinstance(value, dict):
+                return {key: ('[REDACTED]' if re.search(
+                    r'token|secret|password|authorization|cookie|credential', key, re.I)
+                    else clean(item)) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            if isinstance(value, str):
+                if self._token:
+                    value = value.replace(self._token, '[REDACTED]')
+                value = re.sub(r'(?i)Bearer\s+[^\s"<>]+', 'Bearer [REDACTED]', value)
+                return re.sub(
+                    r'(?i)((?:[\w-]*(?:token|secret|password|cookie|credential)|authorization)'
+                    r'[\s"\x27]*[:=][\s"\x27]*)([^\s"\x27<>&,}]+)',
+                    r'\1[REDACTED]', value)
+            return value
+
+        text = raw[:MAX_BODY].decode('utf-8', errors='replace')
+        try:
+            body = clean(json.loads(text))
+        except (ValueError, RecursionError):
+            body = clean(text)
+        logging.getLogger('qoder.results').info(json.dumps({
+            'time': datetime.now(BEIJING).isoformat(), 'event': 'server_response',
+            'method': method, 'url': self.base_url + path.split('?', 1)[0],
+            'attempt': attempt, 'http_status': status, 'body': body,
+            'truncated': len(raw) > MAX_BODY,
+        }, ensure_ascii=False))
+
     def send(self, method: str, path: str, *, empty_body: bool = False) -> Response:
         attempts = 3 if method == "GET" else 1
         for attempt in range(attempts):
@@ -276,6 +308,7 @@ class Transport:
                     time.sleep(2 ** attempt)
                     continue
                 raise ApiError("网络请求失败或超时；请检查网络、代理和证书") from None
+            self.log_response(method, path, attempt + 1, status, raw)
             if status in RETRYABLE and attempt + 1 < attempts:
                 delay = 2 ** attempt
                 retry_after = next((v for k, v in headers.items() if k.lower() == "retry-after"), "")
@@ -399,7 +432,8 @@ class CampaignClient:
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ApiError("活动列表格式未知；未提交领取请求")
         if data.get("showCampaign") is False:
-            return []
+            # 展示开关不能否定接口明确返回的已领取状态；隐藏活动仍不自动领取。
+            return [row for row in rows if row.get("claimStatus") == "CLAIMED"]
         return rows
 
     @staticmethod
@@ -468,7 +502,7 @@ class CampaignClient:
     def status(self) -> dict:
         selected = self.select(self.campaigns())
         if selected is None:
-            return {"result": "unavailable", "message": "本次请求未获得每日 Credits 活动；若客户端可见，请检查设备信息配置",
+            return {"result": "unavailable", "message": "接口未返回每日 Credits 活动，暂无法确认本轮状态；不代表未签到，请稍后查询或查看客户端",
                     "server_status": "NO_DAILY_CAMPAIGN"}
         return self.summarize(selected)
 

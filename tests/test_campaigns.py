@@ -138,3 +138,34 @@ class CampaignTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+class HiddenCampaignTests(unittest.TestCase):
+    def test_hidden_claimed_daily_campaign_is_still_reported_as_claimed(self):
+        transport = Mock()
+        transport.send.return_value = q.Response(200, {
+            'uid': 'current-user', 'showCampaign': False,
+            'campaigns': [daily(state='CLAIMED')],
+        })
+        with patch.object(q.time, 'time', return_value=150):
+            result = q.CampaignClient(transport, 'current-user').claim()
+        self.assertEqual(result['result'], 'already_claimed')
+        transport.send.assert_called_once_with('GET', q.CAMPAIGNS)
+
+    def test_hidden_claimable_campaign_is_not_automatically_claimed(self):
+        transport = Mock()
+        transport.send.return_value = q.Response(200, {
+            'uid': 'current-user', 'showCampaign': False, 'campaigns': [daily()],
+        })
+        with patch.object(q.time, 'time', return_value=150):
+            result = q.CampaignClient(transport, 'current-user').claim()
+        self.assertEqual(result['server_status'], 'NO_DAILY_CAMPAIGN')
+        transport.send.assert_called_once_with('GET', q.CAMPAIGNS)
+
+    def test_missing_campaign_notice_does_not_claim_checkin_is_unavailable(self):
+        import qoder_notify as notify
+        title, content = notify.result_message({
+            'result': 'unavailable', 'server_status': 'NO_DAILY_CAMPAIGN', 'region': 'global',
+        })
+        self.assertNotIn('暂不可签到', title)
+        self.assertIn('未返回', content)
+        self.assertIn('不代表未签到', content)
