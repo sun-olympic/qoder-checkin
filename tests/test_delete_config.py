@@ -35,6 +35,7 @@ class DeleteConfigTests(unittest.TestCase):
         for name in keep:
             self.assertEqual((self.root / name).read_text(), '123456789abc')
 
+    @patch.object(cli.sys, 'platform', 'darwin')
     def test_registered_or_unknown_scheduler_preserves_config(self):
         for result in [True, ScheduleError('cannot query')]:
             with self.subTest(result=result), patch.object(Scheduler, 'status') as status:
