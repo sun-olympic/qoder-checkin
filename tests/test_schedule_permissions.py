@@ -21,7 +21,7 @@ class PermissionTests(unittest.TestCase):
                     self.assertNotIn('StartCalendarInterval', definition)
                     Path(definition['StandardErrorPath']).write_text('PermissionError\n')
                 return subprocess.CompletedProcess(args, 0, 'last exit code = 1', '')
-            with patch.object(s, 'command', side_effect=command):
+            with patch.object(s, 'command', side_effect=command), patch('qoder_schedule.os.getuid', return_value=501, create=True):
                 with self.assertRaises(BackgroundPermissionError):
                     s.preflight([])
             self.assertEqual(calls[-1][1], 'bootout')

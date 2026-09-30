@@ -1,3 +1,4 @@
+import os
 import json
 from pathlib import Path
 import tempfile
@@ -50,7 +51,8 @@ class OfficialLoginTests(unittest.TestCase):
                 else:
                     auth.browser_login('global',target,expected_account_id='owner')
                     self.assertEqual(json.loads(target.read_text())['account_id'],'owner')
-                    self.assertEqual(target.stat().st_mode & 0o777,0o600)
+                    if os.name != 'nt':
+                        self.assertEqual(target.stat().st_mode & 0o777,0o600)
 
     def test_wrong_account_preserves_old_credential(self):
         self.exercise(account='other')

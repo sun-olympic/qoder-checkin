@@ -1,3 +1,4 @@
+import os
 import contextlib
 import io
 import json
@@ -101,7 +102,8 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(send.call_count, 2)
         state = self.path.with_name('config.json.notify-state.json')
         self.assertNotIn('SECRET', state.read_text())
-        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
 
     def test_recovery_and_recipient_change_not_suppressed(self):
         with patch.object(n, 'send') as send:
