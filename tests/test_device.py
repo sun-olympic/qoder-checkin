@@ -11,6 +11,17 @@ import qoder_device as device
 
 
 class DeviceTests(unittest.TestCase):
+    def test_campaign_account_with_identity_defaults_to_qoder_on_macos(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(q.sys, 'platform', 'darwin'):
+            path = Path(tmp) / 'config.json'
+            path.write_text(json.dumps({'accounts': [{
+                'name': 'global', 'region': 'global', 'token_env': 'QODER_GLOBAL_TOKEN',
+                'token_file': 'credentials-global.json', 'api_mode': 'campaigns',
+                'expected_account_id': 'owner'
+            }]}))
+            account = q.load_accounts(path, 'global')[0]
+            self.assertEqual(account.device_source, 'qoder')
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)

@@ -202,7 +202,12 @@ def load_accounts(path: Path, region: str) -> list[Account]:
         source = row.get("auth_source", "file")
         expected = row.get("expected_account_id")
         version = row.get("client_version")
-        device_source = row.get("device_source", "none")
+        # Imported macOS campaign accounts need the same device identity as
+        # the official client. Explicit device_source="none" remains opt-out.
+        default_device_source = (
+            "qoder" if sys.platform == "darwin" and mode == "campaigns" and expected else "none"
+        )
+        device_source = row.get("device_source", default_device_source)
         app_path = row.get("qoder_app_path")
         if device_source not in ("none", "qoder"):
             raise ConfigError("device_source 应为 none/qoder")
