@@ -1,7 +1,8 @@
-"""WeChat test-account notifications; never send Qoder credentials or raw errors."""
+"""WeChat test-account notifications and complete request logging."""
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -27,6 +28,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def request(url, payload=None):
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
     req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'})
+    raw_params = body.decode('utf-8', errors='replace') if body else ''
+    try:
+        params = json.loads(raw_params) if raw_params else {}
+    except (ValueError, RecursionError):
+        params = raw_params
+    logging.getLogger('qoder.results').info(json.dumps({
+        'time': datetime.now(BEIJING).isoformat(), 'event': 'server_request',
+        'method': req.get_method(), 'url': url.split('?', 1)[0],
+        'query': urllib.parse.parse_qs(urllib.parse.urlsplit(url).query, keep_blank_values=True),
+        'params': params, 'headers': dict(req.headers),
+    }, ensure_ascii=False))
     try:
         with urllib.request.build_opener(NoRedirect).open(req, timeout=15) as response:
             raw = response.read(1024 * 1024 + 1)

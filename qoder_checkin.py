@@ -256,30 +256,27 @@ class Transport:
         self.client_version = client_version
         self.opener = request.build_opener(NoRedirect())
 
-    def log_response(self, method: str, path: str, attempt: int, status: int, raw: bytes):
-        """Record the server body before campaign filtering; never log request headers."""
-        def clean(value):
-            if isinstance(value, dict):
-                return {key: ('[REDACTED]' if re.search(
-                    r'token|secret|password|authorization|cookie|credential', key, re.I)
-                    else clean(item)) for key, item in value.items()}
-            if isinstance(value, list):
-                return [clean(item) for item in value]
-            if isinstance(value, str):
-                if self._token:
-                    value = value.replace(self._token, '[REDACTED]')
-                value = re.sub(r'(?i)Bearer\s+[^\s"<>]+', 'Bearer [REDACTED]', value)
-                return re.sub(
-                    r'(?i)((?:[\w-]*(?:token|secret|password|cookie|credential)|authorization)'
-                    r'[\s"\x27]*[:=][\s"\x27]*)([^\s"\x27<>&,}]+)',
-                    r'\1[REDACTED]', value)
-            return value
+    def log_request(self, method: str, path: str, attempt: int, body: bytes, headers: dict):
+        """Record the complete outgoing request verbatim."""
+        raw_params = body.decode('utf-8', errors='replace') if body else ''
+        try:
+            params = json.loads(raw_params) if raw_params else {}
+        except (ValueError, RecursionError):
+            params = raw_params
+        query = parse.parse_qs(parse.urlsplit(path).query, keep_blank_values=True)
+        logging.getLogger('qoder.results').info(json.dumps({
+            'time': datetime.now(BEIJING).isoformat(), 'event': 'server_request',
+            'method': method, 'url': self.base_url + path.split('?', 1)[0],
+            'query': query, 'params': params, 'headers': dict(headers), 'attempt': attempt,
+        }, ensure_ascii=False))
 
+    def log_response(self, method: str, path: str, attempt: int, status: int, raw: bytes):
+        """Record the server body before campaign filtering, verbatim."""
         text = raw[:MAX_BODY].decode('utf-8', errors='replace')
         try:
-            body = clean(json.loads(text))
+            body = json.loads(text)
         except (ValueError, RecursionError):
-            body = clean(text)
+            body = text
         logging.getLogger('qoder.results').info(json.dumps({
             'time': datetime.now(BEIJING).isoformat(), 'event': 'server_response',
             'method': method, 'url': self.base_url + path.split('?', 1)[0],
@@ -300,6 +297,7 @@ class Transport:
                                            "Cosy-ClientType": "10",
                                            **({"Cosy-Version": self.client_version} if self.client_version else {}),
                                            **self.device_headers})
+            self.log_request(method, path, attempt + 1, req.data or b'', dict(req.headers))
             try:
                 try:
                     response = self.opener.open(req, timeout=self.timeout)
@@ -393,6 +391,13 @@ class Client:
     def claim(self) -> dict:
         before = self.status()
         if before["result"] != "claimable":
+            logging.getLogger('qoder.results').info(json.dumps({
+                'time': datetime.now(BEIJING).isoformat(),
+                'event': 'claim_skipped',
+                'reason': before.get('result'),
+                'message': before.get('message'),
+                'campaign_id': before.get('campaign_id'),
+            }, ensure_ascii=False))
             return before
         try:
             response = self.transport.send("POST", PREFIX + "/claim")
