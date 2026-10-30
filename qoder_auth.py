@@ -88,6 +88,6 @@ def _launch_login_context(playwright, profile_name: str):
         )
 
 
-def browser_login(region, output, timeout_seconds=300, expected_account_id=None, isolated=False):
+def browser_login(region, output, timeout_seconds=300, expected_account_id=None, isolated=False, **options):
     from qoder_cli_auth import browser_login as official_login
-    return official_login(region, output, timeout_seconds, expected_account_id, isolated=isolated)
+    return official_login(region, output, timeout_seconds, expected_account_id, isolated=isolated, **options)

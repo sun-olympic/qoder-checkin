@@ -89,7 +89,27 @@ node import_macos_auth.mjs --region cn
 }
 ```
 
-`--region global|cn|both` 选择地区。`install` 未指定地区时沿用已保存的 `schedule.region`，首次安装默认 both；其他命令仍默认 both。配置向导修改时间会保留原地区范围。`install --region global` 注册的任务只运行国际版；若改变任务的地区范围需重新安装。账号增删改名通过编辑配置完成，暂未实现独立账户管理命令。
+`--region global|cn|both` 选择地区。`install` 未指定地区时沿用已保存的 `schedule.region`，首次安装默认 both；其他命令仍默认 both。配置向导修改时间会保留原地区范围。`install --region global` 注册的任务只运行国际版；若改变任务的地区范围需重新安装。账号管理见下节 `accounts` 命令。
+
+## 账号管理
+
+```bash
+python3 checkin_cli.py accounts list                   # 显示名、地区、绑定账号、凭证到期状态（不调用接口、不输出 Token）
+python3 checkin_cli.py accounts refresh 名称            # 浏览器重新登录并刷新该账号凭证
+python3 checkin_cli.py accounts rename 名称 新显示名     # 省略新显示名则交互输入；留空恢复登录昵称
+python3 checkin_cli.py accounts remove 名称             # 确认后从配置移除，并询问是否删除凭证文件
+```
+
+`名称` 可用 `list` 里的内部标识或显示名（显示名重名时请用内部标识）。`refresh` 使用该账号自己的持久 CLI 登录态（`.qoder-cli-runtime/sessions/<凭证文件名>`），先静默续期，失败才打开浏览器；已绑定 `expected_account_id` 的账号只接受同一身份，登录成功并通过接口校验后才原子替换凭证，失败、取消或账号不符均保留原凭证；未绑定身份的账号刷新后会绑定新身份。当前仅国际版支持浏览器刷新，国内版请手动更新凭证文件。`remove` 会一并删除该账号的 CLI 登录态；不会删除被其他账号共用的凭证文件或登录态，也不能删除最后一个账号（请用 `delete-config`），签到任务运行期间会拒绝删除或刷新。账号增删改名不需要重新 `install`，除非定时任务的地区范围内已没有账号。
+
+### 凭证自动续期
+
+访问 Token 由服务端签发，固定有效 30 天；登录态里的 `refresh_token` 有效约一年，且每次续期都会顺延。官方 CLI 在启动时会自行续期已过期（或剩余不足约 1–2 小时）的 Token，本项目借此实现无界面续期：
+
+- 每次 `run`（含定时任务）领取前，对距到期不足 3 天或已过期的国际版账号，先让官方 CLI 执行 `status` 触发续期，再导入、校验身份并原子替换凭证；续期失败不影响本次领取，原凭证保持不变。
+- 续期需要账号的 CLI 登录态：`wizard` 新增账号和 `accounts refresh` 会为账号保留（`login` 的共享登录态也可回退使用，导入时仍校验账号身份）。`accounts list` 的“自动续期”一行显示是否就绪；未就绪的老账号运行一次 `accounts refresh 名称` 即可。
+- 无法自动续期（无登录态、国内版/手动 Token、CLI 或 Node.js 不可用、`refresh_token` 过期）时，会写入日志，并在已配置微信时推送“Qoder 凭证需要处理”，提示运行 `accounts refresh 名称`。设置了 `QODER_*_TOKEN` 环境变量或 `auth_source: macos` 的账号不参与。
+- 续期依赖官方 CLI 1.1.64 的内部行为（实测：已过期 3 天的登录态仍可续期，续期不会作废旧访问 Token）；该行为变化时会退化为上述提醒。长期不运行超过一年则需重新登录。
 
 当前本机已启用以下配置（不需要重装定时任务）：
 

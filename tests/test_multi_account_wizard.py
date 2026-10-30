@@ -6,6 +6,36 @@ import checkin_cli as cli
 
 
 class MultiAccountWizardTests(unittest.TestCase):
+    def test_failed_browser_add_removes_its_cli_session(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(cli.qoder_cli_auth, 'RUNTIME', Path(tmp)/'rt'):
+            config = {'accounts': [{'name':'old','region':'global','expected_account_id':'uid'}]}
+            seen = []
+            def login(region, output, **kwargs):
+                session = Path(kwargs['session_dir'])
+                (session/'.auth').mkdir(parents=True)
+                seen.append(session)
+                cli.q.private_json(output, {'token':'fake','account_id':'uid'})
+                return {'account_id':'uid'}  # duplicate identity -> rejected
+            with patch('builtins.input', side_effect=['a','new','global','1']), \
+                    patch.object(cli.qoder_auth, 'browser_login', side_effect=login):
+                with self.assertRaises(cli.q.ConfigError):
+                    cli.wizard_accounts(config, Path(tmp))
+            self.assertTrue(seen)
+            self.assertFalse(seen[0].exists())
+
+    def test_successful_browser_add_keeps_session_for_silent_renewal(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(cli.qoder_cli_auth, 'RUNTIME', Path(tmp)/'rt'):
+            config = {'accounts': []}
+            def login(region, output, **kwargs):
+                (Path(kwargs['session_dir'])/'.auth').mkdir(parents=True)
+                cli.q.private_json(output, {'token':'fake','account_id':'uid'})
+                return {'account_id':'uid'}
+            with patch('builtins.input', side_effect=['a','work','global','1','']), \
+                    patch.object(cli.qoder_auth, 'browser_login', side_effect=login):
+                cli.wizard_accounts(config, Path(tmp))
+            stem = Path(config['accounts'][0]['token_file']).stem
+            self.assertTrue((Path(tmp)/'rt/sessions'/stem/'.auth').exists())
+
     def test_duplicate_browser_identity_does_not_publish_credential(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {'accounts': [{'name':'old','region':'global','expected_account_id':'uid'}]}

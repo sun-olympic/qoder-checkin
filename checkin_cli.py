@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse
 from contextlib import contextmanager, ExitStack
-from datetime import datetime
+from datetime import datetime, timezone
 from getpass import getpass
 import json
 import errno
@@ -21,6 +21,7 @@ import uuid
 
 import qoder_checkin as q
 import qoder_auth
+import qoder_cli_auth
 import qoder_notify as notify
 from qoder_schedule import Scheduler, ScheduleError, BackgroundPermissionError
 
@@ -76,16 +77,89 @@ def run_lock(config):
         file.close()
 
 
+RENEW_WITHIN = 3 * 86400  # start trying this early; the CLI itself only refreshes at ~<=1h left or once expired
+
+
+def seconds_left(token_file):
+    try:
+        expires = json.loads(token_file.read_text(encoding='utf-8')).get('expiresAt')
+        return (datetime.fromisoformat(expires.replace('Z', '+00:00')) - datetime.now(timezone.utc)).total_seconds()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def renew_session(account):
+    """Persistent official-CLI session able to renew this account without a browser, else None."""
+    if account.region != 'global' or not account.token_file or account.auth_source != 'file':
+        return None
+    for directory in (qoder_cli_auth.account_session_dir(account.token_file),
+                      qoder_cli_auth.RUNTIME / 'auth-global'):  # shared session from `login`; identity is verified on import
+        if (directory / '.auth/user').is_file():
+            return directory
+
+
+def renew_expiring(config_path, region):
+    """Best effort, never blocks the check-in: let the official CLI renew credentials expiring soon.
+
+    Returns one reminder per account that still needs the user (cannot renew, or already expired)."""
+    reminders = []
+    for account in q.load_accounts(config_path, region):
+        file = account.token_file
+        if not file or account.auth_source != 'file' or os.environ.get(account.token_env, '').strip():
+            continue
+        left = seconds_left(file)
+        if left is None or left > RENEW_WITHIN:
+            continue
+        session, reason = renew_session(account), None
+        if session is None:
+            reason = '没有可自动续期的登录态（国内版或手动 Token 需手动更新）'
+        else:
+            try:
+                qoder_auth.browser_login(account.region, file, expected_account_id=account.expected_account_id,
+                                         session_dir=session, interactive=False)
+            except (q.CheckinError, OSError, ValueError) as exc:
+                reason = str(exc)
+            else:
+                renewed = seconds_left(file)
+                if renewed is not None and renewed > left + 60:
+                    print(f'账号「{account.display_name}」凭证已自动续期。')
+                elif renewed is not None and renewed <= 0:
+                    reason = '续期后凭证仍已过期'
+        if reason:
+            expired = (seconds_left(file) or 1) <= 0
+            reminders.append(f'账号「{account.display_name}」凭证{"已过期" if expired else "即将到期"}，'
+                             f'无法自动续期：{reason}；请运行 accounts refresh {account.name}')
+    return reminders
+
+
+def remind(config, reminders, send):
+    logger = logging.getLogger('qoder.results')
+    for line in reminders:
+        print(line, file=sys.stderr)
+    logger.warning(json.dumps({'time':datetime.now(q.BEIJING).isoformat(), 'renew':'needs_attention',
+                               'messages':reminders}, ensure_ascii=False))
+    if send:
+        try:
+            if notify.validate(config) == 'wx_test':
+                notify.send(config, 'Qoder 凭证需要处理', '；'.join(reminders)[:200])
+        except notify.NotifyError as exc:
+            logger.error(json.dumps({'time':datetime.now(q.BEIJING).isoformat(), 'notification':'failed',
+                                     'message':str(exc)}, ensure_ascii=False))
+
+
 def run(args):
     config = read_config(args.config)
     with run_lock(args.config) as acquired:
         if not acquired:
             print('已有领取任务运行，本次跳过')
             return 0
+        reminders = renew_expiring(args.config, args.region)
         results = q.run_once(args.config, args.region, 'status' if args.dry_run else 'claim', 20)
         q.emit(results, True)
         logging.getLogger('qoder.results').info(json.dumps(
             {'time':datetime.now(q.BEIJING).isoformat(), 'accounts':results}, ensure_ascii=False))
+        if reminders:
+            remind(config, reminders, send=not args.dry_run)
         if not args.dry_run:
             try:
                 notification = notify.notify_results(config, args.config, results)
@@ -274,10 +348,15 @@ def wizard_accounts(config, directory):
             candidate = Path(tmp) / 'credential.json'
             if mode == '1':
                 print('请在浏览器中选择新账号；若自动登录旧账号，请先退出网站登录后重试。')
-                result = qoder_auth.browser_login(region, candidate, isolated=True)
-                uid = result['account_id']
-                if any(r.get('region') == region and r.get('expected_account_id') == uid for r in rows):
-                    raise q.ConfigError('该登录账号已绑定；请切换浏览器账号后重新添加')
+                session = qoder_cli_auth.account_session_dir(credential)  # kept: lets the CLI renew silently later
+                try:
+                    result = qoder_auth.browser_login(region, candidate, isolated=True, session_dir=session)
+                    uid = result['account_id']
+                    if any(r.get('region') == region and r.get('expected_account_id') == uid for r in rows):
+                        raise q.ConfigError('该登录账号已绑定；请切换浏览器账号后重新添加')
+                except BaseException:
+                    shutil.rmtree(session, ignore_errors=True)  # never keep a session that was not bound
+                    raise
                 account['expected_account_id'] = uid
             else:
                 token = getpass('Bearer Token（不回显）：').strip()
@@ -289,6 +368,103 @@ def wizard_accounts(config, directory):
             os.link(candidate, credential)
         rows.append(account)
         config.setdefault('schedule', {})['region'] = 'both'
+
+
+def credential_status(account):
+    try:
+        account.token()
+    except q.CheckinError as exc:
+        return str(exc)
+    try:
+        expires = json.loads(account.token_file.read_text(encoding='utf-8')).get('expiresAt')
+        expires = datetime.fromisoformat(expires.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d %H:%M')
+    except (AttributeError, OSError, TypeError, ValueError):
+        return '有效（无到期信息）'
+    return f'有效，到期 {expires}'
+
+
+def pick_account(accounts, key):
+    hits = [i for i, a in enumerate(accounts) if key in (a.name, a.display_name)]
+    if not hits:
+        raise q.ConfigError(f'未找到账号「{key}」，可先运行 accounts list')
+    if len(hits) > 1:
+        raise q.ConfigError(f'「{key}」匹配多个账号，请改用内部账号标识')
+    return hits[0]
+
+
+def accounts_command(args):
+    """Standalone account management: list / refresh / remove / rename."""
+    action, *rest = args.params or ['list']
+    if action not in ('list', 'refresh', 'remove', 'rename'):
+        raise q.ConfigError('用法：accounts list | refresh 名称 | remove 名称 | rename 名称 [显示名]')
+    config = read_config(args.config)
+    accounts = q.load_accounts(args.config, 'both')
+    if action == 'list':
+        stale = False
+        for n, a in enumerate(accounts, 1):
+            status = credential_status(a)
+            stale |= not status.startswith('有效')
+            renew = '已就绪' if renew_session(a) else '未就绪（运行 accounts refresh 登录一次）'
+            print(f'[{n}] {a.display_name}（内部标识 {a.name}）\n'
+                  f'    地区：{a.region} | 绑定账号：{a.expected_account_id or "未绑定"} | 凭证：{status}\n'
+                  f'    自动续期：{renew}')
+        if stale:
+            print('凭证失效的账号可运行：accounts refresh <名称> 重新登录刷新。')
+        return 0
+    if not rest:
+        raise q.ConfigError('请指定账号名称或显示名，可先运行 accounts list')
+    index, rows = pick_account(accounts, rest[0]), config['accounts']
+    account = accounts[index]
+    if action == 'rename':
+        label = rest[1] if len(rest) > 1 else input('自定义显示名称（留空使用登录昵称）：').strip()
+        if len(label) > 64 or any(ord(c) < 32 for c in label):
+            raise q.ConfigError('显示名称必须为不超过 64 字的单行文本')
+        rows[index]['display_name'] = label
+        save_config(args.config, config)
+        print('显示名称已更新。')
+    elif action == 'refresh':
+        target = account.token_file
+        if target is None:
+            raise q.ConfigError('该账号未配置 token_file，无法刷新')
+        print(f'将刷新账号「{account.display_name}」：先尝试静默续期，失败再打开浏览器登录。')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Own persistent session (never the shared one); staging dir on target's filesystem for atomic publish.
+        with run_lock(args.config) as acquired, \
+                tempfile.TemporaryDirectory(prefix='.qoder-add-', dir=target.parent) as tmp:
+            if not acquired:
+                raise q.ConfigError('已有签到任务运行，请等待完成后再刷新')
+            candidate = Path(tmp) / 'credential.json'
+            result = qoder_auth.browser_login(account.region, candidate,
+                                              expected_account_id=account.expected_account_id, isolated=True,
+                                              session_dir=qoder_cli_auth.account_session_dir(target))
+            os.replace(candidate, target)
+        if not account.expected_account_id:
+            rows[index]['expected_account_id'] = result['account_id']
+            save_config(args.config, config)
+        print('凭证已刷新；无需重新 install。')
+    else:  # remove
+        if len(rows) == 1:
+            raise q.ConfigError('不能删除最后一个账号；如需清空配置请使用 delete-config')
+        with run_lock(args.config) as acquired:
+            if not acquired:
+                raise q.ConfigError('已有签到任务运行，请等待完成后再删除账号')
+            if input(f'确认删除账号「{account.display_name}」（{account.region}）？y/N：').strip().lower() != 'y':
+                print('已取消。')
+                return 0
+            file = account.token_file
+            shared = any(a.token_file == file for i, a in enumerate(accounts) if i != index)
+            drop_file = bool(file and file.exists() and not shared and
+                             input(f'同时删除凭证文件 {file}？y/N：').strip().lower() == 'y')
+            del rows[index]
+            save_config(args.config, config)  # config first: never leave it pointing at a deleted file
+            if drop_file:
+                file.unlink()
+            if file and not shared:  # its CLI session holds a refresh token: remove with the account
+                shutil.rmtree(qoder_cli_auth.account_session_dir(file), ignore_errors=True)
+        print('账号已删除' + ('，凭证文件已删除。' if drop_file else '；凭证文件已保留。'))
+        if config.get('schedule', {}).get('region', 'both') not in ('both', *{r['region'] for r in rows}):
+            print('提示：定时任务地区范围内已无账号，请重新 install 并指定 --region。')
+    return 0
 
 
 def wizard(args):
@@ -500,20 +676,23 @@ def validate_time(at):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Qoder 安装、诊断和系统定时任务')
-    parser.add_argument('command', choices=['wizard','doctor','install','uninstall','delete-config','status','run','login','wx-bind','wx-setup','test-notify'])
+    parser.add_argument('command', choices=['wizard','doctor','install','uninstall','delete-config','status','run','login','wx-bind','wx-setup','test-notify','accounts'])
+    parser.add_argument('params', nargs='*', help='accounts 子命令及参数：list | refresh 名称 | remove 名称 | rename 名称 [显示名]')
     parser.add_argument('--config', type=Path, default=q.ROOT/'config.json')
     parser.add_argument('--region', choices=['both','global','cn'],default=None)
     parser.add_argument('--at', help='系统定时任务时间，电脑本地时区，默认 10:05')
     parser.add_argument('--dry-run', action='store_true',help='run 只查询，不领取')
     parser.add_argument('--login-region', choices=['global', 'cn'], default=None)
-    args=parser.parse_args(argv)
+    args=parser.parse_intermixed_args(argv)
+    if args.params and args.command != 'accounts':
+        parser.error('该命令不接受额外参数：' + ' '.join(args.params))
     args.config=args.config.expanduser().resolve()
     # pythonw has no console; scheduled results still go to the rotating file log.
     for name in ('stdout','stderr'):
         if getattr(sys,name) is None: setattr(sys,name,open(os.devnull,'w',encoding='utf-8'))
     try:
         with ExitStack() as management:
-            if args.command in ('wizard', 'install', 'uninstall', 'delete-config', 'login', 'wx-bind', 'wx-setup'):
+            if args.command in ('wizard', 'install', 'uninstall', 'delete-config', 'login', 'wx-bind', 'wx-setup', 'accounts'):
                 args.config.parent.mkdir(parents=True, exist_ok=True)
                 lock_target = args.config.with_name(args.config.name + '.setup')
                 if not management.enter_context(run_lock(lock_target)):
@@ -534,6 +713,7 @@ def main(argv=None):
             if args.command=='wx-bind': return wx_bind(args)
             if args.command=='wx-setup': return wx_setup(args)
             if args.command=='login': return qoder_login(args)
+            if args.command=='accounts': return accounts_command(args)
             if args.command=='test-notify': return test_notify(args)
             if args.command=='wizard': return wizard(args)
             if args.command=='doctor': return doctor(args)

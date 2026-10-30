@@ -56,33 +56,50 @@ def ensure_cli():
     return binary
 
 
-def browser_login(region, output, timeout_seconds=300, expected_account_id=None, isolated=False):
+def account_session_dir(token_file):
+    """Persistent per-account CLI session: keeps the refresh token so the CLI can renew without a browser."""
+    return RUNTIME / 'sessions' / Path(token_file).stem
+
+
+def browser_login(region, output, timeout_seconds=300, expected_account_id=None, isolated=False,
+                  session_dir=None, interactive=True):
+    """Import a credential from an official-CLI session.
+
+    A cached session is first run through `status` (the CLI refreshes an expired or near-expiry token
+    on startup), then imported. interactive=False never opens a browser: it only renews from a cached session.
+    """
     if region != 'global':
         raise q.ConfigError('国内版 CLI 授权尚未适配，请选择手动 Token；不会跳转国际版登录')
     node = shutil.which('node')
     if not node:
         raise q.ConfigError('读取官方 CLI 凭证需要 Node.js，请先安装 Node.js')
-    binary = ensure_cli()
     config = RUNTIME / 'auth-global'
     if isolated:
         # The caller's staging directory is unique and cleaned after import.
         config = Path(output).resolve().parent / 'cli-session'
+    if session_dir:
+        config = Path(session_dir)
+    session = config / '.auth/user'
+    if not interactive and not session.is_file():
+        raise q.AuthError('没有可用的官方 CLI 登录态，无法自动续期')
+    binary = ensure_cli()
     environment = dict(os.environ)
     # Prevent external terminal credentials from silently changing login identity.
     for name in ('QODER_PERSONAL_ACCESS_TOKEN', 'QODER_CONFIG_DIR'):
         environment.pop(name, None)
-    print('请在系统浏览器完成 Qoder 授权；完成后自动验证签到接口。', flush=True)
-    try:
-        if not (config / '.auth/user').is_file():
-            result = subprocess.run([str(binary), '--config-dir', str(config), 'login'],
-                                    env=environment, timeout=timeout_seconds)
-            if result.returncode:
-                raise q.AuthError('官方 CLI 登录未完成；原凭证未修改')
-        else:
-            print('发现本项目的官方 CLI 登录态，先验证并导入。')
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='.qoder-auth-', dir=output.parent) as directory:
+    if interactive:
+        print('请在系统浏览器完成 Qoder 授权；完成后自动验证签到接口。', flush=True)
+
+    def login():
+        result = subprocess.run([str(binary), '--config-dir', str(config), 'login'],
+                                env=environment, timeout=timeout_seconds)
+        if result.returncode:
+            raise q.AuthError('官方 CLI 登录未完成；原凭证未修改')
+
+    def import_credential():
+        target = Path(output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.qoder-auth-', dir=target.parent) as directory:
             candidate = Path(directory) / 'credential.json'
             imported = subprocess.run([node, str(ROOT/'import_cli_auth.mjs'), str(binary),
                                        str(config), str(candidate)], capture_output=True, timeout=30)
@@ -98,7 +115,29 @@ def browser_login(region, output, timeout_seconds=300, expected_account_id=None,
                                 expected_account_id=uid)
             rows = q.CampaignClient(q.Transport(q.BASES[region], account.token()), uid).campaigns()
             candidate.chmod(0o600)
-            os.replace(candidate, output)
+            os.replace(candidate, target)
             return {'account_id': uid, 'campaign_count': len(rows), 'source': 'qoder-cli'}
+
+    try:
+        reused = session.is_file()
+        if reused:
+            if interactive:
+                print('发现本项目的官方 CLI 登录态，先验证并导入。')
+            # Exit code ignored on purpose: a failed refresh surfaces as an expired token at import.
+            subprocess.run([str(binary), '--config-dir', str(config), 'status'],
+                           env=environment, capture_output=True, timeout=60)
+        else:
+            login()
+        try:
+            return import_credential()
+        except q.AuthError as exc:
+            if not reused or not interactive:
+                raise
+            # ponytail: any AuthError on a cached session is treated as stale (expired token, wrong
+            # account, unreadable); clear it and authorize once. Ceiling: no finer-grained reason check.
+            print(f'{exc}；已清除失效的登录态，重新打开浏览器授权。', flush=True)
+            session.unlink(missing_ok=True)
+        login()
+        return import_credential()
     except subprocess.TimeoutExpired:
         raise q.AuthError('官方 CLI 授权或导入超时；原凭证未修改') from None
