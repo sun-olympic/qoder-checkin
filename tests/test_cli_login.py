@@ -112,6 +112,16 @@ class OfficialLoginTests(unittest.TestCase):
         self.assertEqual(events, [('login', False), ('import',)])
         self.assertIsNone(saved)
 
+    def test_browser_prompt_only_when_a_browser_is_actually_needed(self):
+        import contextlib, io
+        prompt = '请在系统浏览器完成 Qoder 授权'
+        with contextlib.redirect_stdout(io.StringIO()) as silent:   # cached, valid session: no browser
+            self.relogin(True, ['2099-01-01T00:00:00Z'])
+        with contextlib.redirect_stdout(io.StringIO()) as fresh:    # no session: browser login
+            self.relogin(False, ['2099-01-01T00:00:00Z'])
+        self.assertNotIn(prompt, silent.getvalue())
+        self.assertIn(prompt, fresh.getvalue())
+
     def test_noninteractive_renews_from_cached_session_without_browser(self):
         events, saved, _, _ = self.relogin(True, ['2099-01-01T00:00:00Z'], interactive=False)
         self.assertEqual(events, [('status',), ('import',)])

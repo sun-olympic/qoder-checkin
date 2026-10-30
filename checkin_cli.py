@@ -428,6 +428,7 @@ def accounts_command(args):
             raise q.ConfigError('该账号未配置 token_file，无法刷新')
         print(f'将刷新账号「{account.display_name}」：先尝试静默续期，失败再打开浏览器登录。')
         target.parent.mkdir(parents=True, exist_ok=True)
+        before = seconds_left(target)
         # Own persistent session (never the shared one); staging dir on target's filesystem for atomic publish.
         with run_lock(args.config) as acquired, \
                 tempfile.TemporaryDirectory(prefix='.qoder-add-', dir=target.parent) as tmp:
@@ -441,7 +442,13 @@ def accounts_command(args):
         if not account.expected_account_id:
             rows[index]['expected_account_id'] = result['account_id']
             save_config(args.config, config)
-        print('凭证已刷新；无需重新 install。')
+        after = seconds_left(target)
+        if before is None or after is None:
+            print('凭证已导入；无需重新 install。')
+        elif after > before + 60:
+            print(f'已续期：{credential_status(account)}；无需重新 install。')
+        else:  # the CLI only renews an expired / near-expiry token, so a healthy one is imported unchanged
+            print(f'凭证无需续期（{credential_status(account)}）；官方 CLI 仅在到期前约 1 小时内才会续期。')
     else:  # remove
         if len(rows) == 1:
             raise q.ConfigError('不能删除最后一个账号；如需清空配置请使用 delete-config')

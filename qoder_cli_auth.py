@@ -87,10 +87,9 @@ def browser_login(region, output, timeout_seconds=300, expected_account_id=None,
     # Prevent external terminal credentials from silently changing login identity.
     for name in ('QODER_PERSONAL_ACCESS_TOKEN', 'QODER_CONFIG_DIR'):
         environment.pop(name, None)
-    if interactive:
-        print('请在系统浏览器完成 Qoder 授权；完成后自动验证签到接口。', flush=True)
 
     def login():
+        print('请在系统浏览器完成 Qoder 授权；完成后自动验证签到接口。', flush=True)
         result = subprocess.run([str(binary), '--config-dir', str(config), 'login'],
                                 env=environment, timeout=timeout_seconds)
         if result.returncode:

@@ -140,6 +140,23 @@ class AccountsCommandTests(unittest.TestCase):
         self.assertEqual(json.loads((self.dir / 'a.json').read_text())['token'], 'new')
         self.assertFalse(self.staging())
 
+    def refresh_message(self, old_days, new_days):
+        from datetime import datetime, timedelta, timezone
+        iso = lambda d: (datetime.now(timezone.utc) + timedelta(days=d)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        (self.dir / 'a.json').write_text(json.dumps({'token': 't', 'account_id': 'uid-1', 'expiresAt': iso(old_days)}))
+        path, _ = self.config([row('a', expected_account_id='uid-1')])
+        def login(region, output, **kwargs):
+            Path(output).write_text(json.dumps({'token': 't', 'account_id': 'uid-1', 'expiresAt': iso(new_days)}))
+            return {'account_id': 'uid-1'}
+        with patch.object(cli.qoder_auth, 'browser_login', side_effect=login):
+            return run(['accounts', 'refresh', 'a', '--config', str(path)])[1]
+
+    def test_refresh_says_renewed_only_when_expiry_actually_moved(self):
+        self.assertIn('已续期', self.refresh_message(old_days=-1, new_days=30))
+        unchanged = self.refresh_message(old_days=20, new_days=20)
+        self.assertIn('无需续期', unchanged)
+        self.assertNotIn('已续期', unchanged)
+
     def test_refresh_wrong_account_keeps_old_credential(self):
         cli.q.private_json(self.dir / 'a.json', {'token': 'old'})
         def login(region, output, **kwargs):
