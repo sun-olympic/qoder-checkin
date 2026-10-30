@@ -60,6 +60,21 @@ class AccountsCommandTests(unittest.TestCase):
         self.assertEqual(self.saved(path)[0]['display_name'], '')
         self.assertEqual(run(['accounts', 'rename', 'a', 'x' * 65, '--config', str(path)])[0], 2)
 
+    def test_target_can_be_the_bound_account_id_but_only_exactly(self):
+        path, _ = self.config([row('a', expected_account_id='uid-1'), row('b', expected_account_id='uid-2')])
+        self.assertEqual(run(['accounts', 'rename', 'uid-2', '二号', '--config', str(path)])[0], 0)
+        self.assertEqual(self.saved(path)[1]['display_name'], '二号')
+        before = path.read_text()
+        self.assertEqual(run(['accounts', 'rename', 'uid', 'x', '--config', str(path)])[0], 2)  # no prefix match
+        self.assertEqual(path.read_text(), before)
+
+    def test_shared_bound_account_id_is_ambiguous(self):
+        path, _ = self.config([row('a', expected_account_id='uid-1'),
+                               row('b', region='cn', token_file='b.json', expected_account_id='uid-1')])
+        before = path.read_text()
+        self.assertEqual(run(['accounts', 'rename', 'uid-1', 'x', '--config', str(path)])[0], 2)
+        self.assertEqual(path.read_text(), before)
+
     def test_ambiguous_or_unknown_target_changes_nothing(self):
         path, _ = self.config([row('a', display_name='same'), row('b', display_name='same')])
         before = path.read_text()

@@ -384,11 +384,11 @@ def credential_status(account):
 
 
 def pick_account(accounts, key):
-    hits = [i for i, a in enumerate(accounts) if key in (a.name, a.display_name)]
+    hits = [i for i, a in enumerate(accounts) if key in (a.name, a.display_name, a.expected_account_id)]
     if not hits:
         raise q.ConfigError(f'未找到账号「{key}」，可先运行 accounts list')
     if len(hits) > 1:
-        raise q.ConfigError(f'「{key}」匹配多个账号，请改用内部账号标识')
+        raise q.ConfigError(f'「{key}」匹配多个账号，请改用内部账号标识（accounts list 中的“内部标识”）')
     return hits[0]
 
 
