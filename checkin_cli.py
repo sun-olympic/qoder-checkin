@@ -426,19 +426,38 @@ def accounts_command(args):
         target = account.token_file
         if target is None:
             raise q.ConfigError('该账号未配置 token_file，无法刷新')
-        print(f'将刷新账号「{account.display_name}」：先尝试静默续期，失败再打开浏览器登录。')
+        print(f'将重新登录账号「{account.display_name}」：打开浏览器，成功后替换凭证和登录态。' if args.relogin else
+              f'将刷新账号「{account.display_name}」：先尝试静默续期，失败再打开浏览器登录。')
         target.parent.mkdir(parents=True, exist_ok=True)
         before = seconds_left(target)
         # Own persistent session (never the shared one); staging dir on target's filesystem for atomic publish.
+        session = qoder_cli_auth.account_session_dir(target)
+        # --relogin logs into a brand-new session dir and only swaps it in on success, so a cancelled or
+        # wrong-account login never costs the account its working session.
+        staging = session.with_name(session.name + '.new') if args.relogin else session
         with run_lock(args.config) as acquired, \
                 tempfile.TemporaryDirectory(prefix='.qoder-add-', dir=target.parent) as tmp:
             if not acquired:
                 raise q.ConfigError('已有签到任务运行，请等待完成后再刷新')
             candidate = Path(tmp) / 'credential.json'
-            result = qoder_auth.browser_login(account.region, candidate,
-                                              expected_account_id=account.expected_account_id, isolated=True,
-                                              session_dir=qoder_cli_auth.account_session_dir(target))
-            os.replace(candidate, target)
+            if args.relogin:
+                shutil.rmtree(staging, ignore_errors=True)  # leftover of an interrupted run
+            try:
+                result = qoder_auth.browser_login(account.region, candidate,
+                                                  expected_account_id=account.expected_account_id, isolated=True,
+                                                  session_dir=staging)
+                os.replace(candidate, target)
+            except BaseException:
+                if args.relogin:
+                    shutil.rmtree(staging, ignore_errors=True)
+                raise
+            if args.relogin:
+                old = session.with_name(session.name + '.old')
+                shutil.rmtree(old, ignore_errors=True)
+                if session.exists():
+                    os.replace(session, old)
+                os.replace(staging, session)
+                shutil.rmtree(old, ignore_errors=True)
         if not account.expected_account_id:
             rows[index]['expected_account_id'] = result['account_id']
             save_config(args.config, config)
@@ -690,9 +709,12 @@ def main(argv=None):
     parser.add_argument('--at', help='系统定时任务时间，电脑本地时区，默认 10:05')
     parser.add_argument('--dry-run', action='store_true',help='run 只查询，不领取')
     parser.add_argument('--login-region', choices=['global', 'cn'], default=None)
+    parser.add_argument('--relogin', action='store_true', help='accounts refresh：强制打开浏览器重新登录，成功后立即换成新的 30 天 Token')
     args=parser.parse_intermixed_args(argv)
     if args.params and args.command != 'accounts':
         parser.error('该命令不接受额外参数：' + ' '.join(args.params))
+    if args.relogin and not (args.command == 'accounts' and args.params[:1] == ['refresh']):
+        parser.error('--relogin 仅用于 accounts refresh')
     args.config=args.config.expanduser().resolve()
     # pythonw has no console; scheduled results still go to the rotating file log.
     for name in ('stdout','stderr'):

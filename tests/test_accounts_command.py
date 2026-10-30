@@ -157,6 +157,57 @@ class AccountsCommandTests(unittest.TestCase):
         self.assertIn('无需续期', unchanged)
         self.assertNotIn('已续期', unchanged)
 
+    def relogin(self, login):
+        """accounts refresh --relogin with an existing own session (marker 'old') under a temp RUNTIME."""
+        runtime = self.dir / 'runtime'
+        own = runtime / 'sessions' / 'a'
+        (own / '.auth').mkdir(parents=True)
+        (own / '.auth/user').write_text('old')
+        cli.q.private_json(self.dir / 'a.json', {'token': 'old', 'account_id': 'uid-1'})
+        path, _ = self.config([row('a', expected_account_id='uid-1')])
+        with patch.object(cli.qoder_cli_auth, 'RUNTIME', runtime), \
+                patch.object(cli.qoder_auth, 'browser_login', side_effect=login) as mocked:
+            code, out = run(['accounts', 'refresh', 'a', '--relogin', '--config', str(path)])
+        return code, out, own, mocked
+
+    def test_relogin_forces_fresh_login_then_swaps_in_the_new_session(self):
+        def login(region, output, **kwargs):
+            staging = Path(kwargs['session_dir'])
+            self.assertTrue(staging.name.endswith('.new'))      # never reuses the cached session
+            self.assertFalse(staging.exists())
+            (staging / '.auth').mkdir(parents=True)
+            (staging / '.auth/user').write_text('new')
+            Path(output).write_text(json.dumps({'token': 'new', 'account_id': 'uid-1'}))
+            return {'account_id': 'uid-1'}
+        code, _, own, _ = self.relogin(login)
+        self.assertEqual(code, 0)
+        self.assertEqual((own / '.auth/user').read_text(), 'new')
+        self.assertEqual(json.loads((self.dir / 'a.json').read_text())['token'], 'new')
+        self.assertEqual(sorted(p.name for p in own.parent.iterdir()), ['a'])  # no .new / .old leftovers
+
+    def test_relogin_failure_keeps_old_session_and_credential(self):
+        def login(region, output, **kwargs):
+            (Path(kwargs['session_dir']) / '.auth').mkdir(parents=True)
+            raise cli.q.AuthError('登录账号与绑定账号不一致；原凭证未修改')
+        code, _, own, _ = self.relogin(login)
+        self.assertEqual(code, 2)
+        self.assertEqual((own / '.auth/user').read_text(), 'old')
+        self.assertEqual(json.loads((self.dir / 'a.json').read_text())['token'], 'old')
+        self.assertEqual(sorted(p.name for p in own.parent.iterdir()), ['a'])
+
+    def test_plain_refresh_still_reuses_the_cached_session(self):
+        seen = []
+        def login(region, output, **kwargs):
+            seen.append(Path(kwargs['session_dir']).name)
+            Path(output).write_text(json.dumps({'token': 'x', 'account_id': 'uid-1'}))
+            return {'account_id': 'uid-1'}
+        runtime = self.dir / 'runtime'
+        path, _ = self.config([row('a', expected_account_id='uid-1')])
+        with patch.object(cli.qoder_cli_auth, 'RUNTIME', runtime), \
+                patch.object(cli.qoder_auth, 'browser_login', side_effect=login):
+            run(['accounts', 'refresh', 'a', '--config', str(path)])
+        self.assertEqual(seen, ['a'])
+
     def test_refresh_wrong_account_keeps_old_credential(self):
         cli.q.private_json(self.dir / 'a.json', {'token': 'old'})
         def login(region, output, **kwargs):
@@ -179,6 +230,9 @@ class AccountsCommandTests(unittest.TestCase):
         self.assertEqual(run(['accounts', 'bogus', '--config', str(path)])[0], 2)
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(['doctor', 'extra', '--config', str(path)])
+        for argv in (['doctor', '--relogin'], ['accounts', 'list', '--relogin'], ['accounts', 'remove', 'a', '--relogin']):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                cli.main(argv + ['--config', str(path)])  # --relogin only belongs to `accounts refresh`
 
 
 if __name__ == '__main__':

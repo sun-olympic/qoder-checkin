@@ -95,12 +95,13 @@ node import_macos_auth.mjs --region cn
 
 ```bash
 python3 checkin_cli.py accounts list                   # 显示名、地区、绑定账号、凭证到期状态（不调用接口、不输出 Token）
-python3 checkin_cli.py accounts refresh 名称            # 浏览器重新登录并刷新该账号凭证
+python3 checkin_cli.py accounts refresh 名称            # 先静默续期，失败再打开浏览器登录
+python3 checkin_cli.py accounts refresh 名称 --relogin  # 强制浏览器重新登录，立即换成新的 30 天 Token
 python3 checkin_cli.py accounts rename 名称 新显示名     # 省略新显示名则交互输入；留空恢复登录昵称
 python3 checkin_cli.py accounts remove 名称             # 确认后从配置移除，并询问是否删除凭证文件
 ```
 
-`名称` 可用 `list` 里的内部标识、显示名或完整的绑定账号 ID（精确匹配；匹配到多个账号时请改用内部标识）。`refresh` 使用该账号自己的持久 CLI 登录态（`.qoder-cli-runtime/sessions/<凭证文件名>`），先静默续期，失败才打开浏览器；已绑定 `expected_account_id` 的账号只接受同一身份，登录成功并通过接口校验后才原子替换凭证，失败、取消或账号不符均保留原凭证；未绑定身份的账号刷新后会绑定新身份。当前仅国际版支持浏览器刷新，国内版请手动更新凭证文件。`remove` 会一并删除该账号的 CLI 登录态；不会删除被其他账号共用的凭证文件或登录态，也不能删除最后一个账号（请用 `delete-config`），签到任务运行期间会拒绝删除或刷新。账号增删改名不需要重新 `install`，除非定时任务的地区范围内已没有账号。
+`名称` 可用 `list` 里的内部标识、显示名或完整的绑定账号 ID（精确匹配；匹配到多个账号时请改用内部标识）。`refresh` 使用该账号自己的持久 CLI 登录态（`.qoder-cli-runtime/sessions/<凭证文件名>`），先静默续期，失败才打开浏览器；已绑定 `expected_account_id` 的账号只接受同一身份，登录成功并通过接口校验后才原子替换凭证，失败、取消或账号不符均保留原凭证；未绑定身份的账号刷新后会绑定新身份。Token 仍健康时普通 `refresh` 只会重新导入同一个 Token（官方 CLI 仅在到期前约 1 小时内才续期），想马上换新用 `--relogin`：它登录到全新的临时登录态，成功后才整体替换旧登录态，取消或账号不符时旧登录态和凭证都不受影响。当前仅国际版支持浏览器刷新，国内版请手动更新凭证文件。`remove` 会一并删除该账号的 CLI 登录态；不会删除被其他账号共用的凭证文件或登录态，也不能删除最后一个账号（请用 `delete-config`），签到任务运行期间会拒绝删除或刷新。账号增删改名不需要重新 `install`，除非定时任务的地区范围内已没有账号。
 
 ### 凭证自动续期
 
