@@ -442,15 +442,22 @@ def accounts_command(args):
             candidate = Path(tmp) / 'credential.json'
             if args.relogin:
                 shutil.rmtree(staging, ignore_errors=True)  # leftover of an interrupted run
+            unconfirmed = None
             try:
                 result = qoder_auth.browser_login(account.region, candidate,
                                                   expected_account_id=account.expected_account_id, isolated=True,
                                                   session_dir=staging)
                 os.replace(candidate, target)
-            except BaseException:
-                if args.relogin:
-                    shutil.rmtree(staging, ignore_errors=True)
-                raise
+            except BaseException as exc:
+                # ponytail: ApiError (never AuthError) means the login and the bound-identity check already
+                # passed and only the confirmation request failed, so keep the fresh session instead of making
+                # the user authorize again. Ceiling: an unbound account has nothing to verify against -> discarded.
+                if isinstance(exc, q.ApiError) and account.expected_account_id:
+                    unconfirmed = exc
+                else:
+                    if args.relogin:
+                        shutil.rmtree(staging, ignore_errors=True)
+                    raise
             if args.relogin:
                 old = session.with_name(session.name + '.old')
                 shutil.rmtree(old, ignore_errors=True)
@@ -458,6 +465,9 @@ def accounts_command(args):
                     os.replace(session, old)
                 os.replace(staging, session)
                 shutil.rmtree(old, ignore_errors=True)
+            if unconfirmed:
+                raise q.ApiError(f'官方登录态已就绪，但验证签到接口失败：{unconfirmed}。原凭证未修改；'
+                                 f'网络恢复后运行 accounts refresh “{account.display_name}” 即可导入，无需再次授权。') from None
         if not account.expected_account_id:
             rows[index]['expected_account_id'] = result['account_id']
             save_config(args.config, config)

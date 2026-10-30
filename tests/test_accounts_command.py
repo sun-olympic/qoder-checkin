@@ -195,6 +195,40 @@ class AccountsCommandTests(unittest.TestCase):
         self.assertEqual(json.loads((self.dir / 'a.json').read_text())['token'], 'old')
         self.assertEqual(sorted(p.name for p in own.parent.iterdir()), ['a'])
 
+    def relogin_unverified_by_network(self, bound=True):
+        """The browser login succeeded but the confirmation request hit a network failure."""
+        def login(region, output, **kwargs):
+            staging = Path(kwargs['session_dir'])
+            (staging / '.auth').mkdir(parents=True)
+            (staging / '.auth/user').write_text('new')
+            raise cli.q.ApiError('网络请求失败或超时；请检查网络、代理和证书')
+        runtime = self.dir / 'runtime'
+        own = runtime / 'sessions' / 'a'
+        (own / '.auth').mkdir(parents=True)
+        (own / '.auth/user').write_text('old')
+        cli.q.private_json(self.dir / 'a.json', {'token': 'old', 'account_id': 'uid-1'})
+        path, _ = self.config([row('a', **({'expected_account_id': 'uid-1'} if bound else {}))])
+        err = io.StringIO()
+        with patch.object(cli.qoder_cli_auth, 'RUNTIME', runtime), \
+                patch.object(cli.qoder_auth, 'browser_login', side_effect=login), contextlib.redirect_stderr(err):
+            code, _ = run(['accounts', 'refresh', 'a', '--relogin', '--config', str(path)])
+        return code, err.getvalue(), own
+
+    def test_relogin_network_failure_keeps_the_authorized_session_not_the_credential(self):
+        code, err, own = self.relogin_unverified_by_network()
+        self.assertEqual(code, 2)
+        self.assertEqual((own / '.auth/user').read_text(), 'new')            # authorization is not thrown away
+        self.assertEqual(json.loads((self.dir / 'a.json').read_text())['token'], 'old')  # credential untouched
+        self.assertEqual(sorted(p.name for p in own.parent.iterdir()), ['a'])  # no .new / .old leftovers
+        self.assertIn('无需再次授权', err)
+        self.assertIn('accounts refresh', err)
+
+    def test_relogin_network_failure_discards_session_when_identity_was_never_bound(self):
+        code, _, own = self.relogin_unverified_by_network(bound=False)
+        self.assertEqual(code, 2)
+        self.assertEqual((own / '.auth/user').read_text(), 'old')            # nothing proves it is the same account
+        self.assertEqual(sorted(p.name for p in own.parent.iterdir()), ['a'])
+
     def test_plain_refresh_still_reuses_the_cached_session(self):
         seen = []
         def login(region, output, **kwargs):
